@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import torch
 from torch import nn
+import numpy as np
 
 from .base_node import Node, NodeContainer
 from ..utils import is_generator_empty
@@ -32,14 +33,19 @@ class TensorNode(Node):
             depth, parents, children, name,
         )
         self.tensor_id = id(tensor)
-        self.tensor_shape = tuple(tensor.shape)
         self.name = name
+        # Convert tensor to regular Tensor before detaching and converting to numpy
+        regular_tensor = tensor.as_subclass(torch.Tensor)
+        self.tensor_data: np.ndarray = regular_tensor.detach().cpu().numpy()
         self.is_aux = is_aux
         self.main_node = self if main_node is None else main_node
         self.context = [] if context is None else context
         self.parent_hierarchy = {} if parent_hierarchy is None else parent_hierarchy
         self.set_node_id()
         self.collect_attributes = collect_attributes
+        
+    def get_tensor_shape(self) -> tuple[int, ...]:
+        return tuple(self.tensor_data.shape)
 
     def set_node_id(self, children_id: int | str | None = None) -> None:
         if children_id is None:

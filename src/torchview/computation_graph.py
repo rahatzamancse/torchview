@@ -386,7 +386,7 @@ class ComputationGraph:
                 label = f'''<
                     <TABLE BORDER="{border}" CELLBORDER="{cell_bor}"
                     CELLSPACING="{cell_sp}" CELLPADDING="{cell_pad}">
-                        <TR><TD>{node.name}<BR/>depth:{node.depth}</TD><TD>{node.tensor_shape}</TD></TR>
+                        <TR><TD>{node.name}<BR/>depth:{node.depth}</TD><TD>{node.get_tensor_shape()}</TD></TR>
                     </TABLE>>'''
             else:
                 input_repr = compact_list_repr(node.input_shape)
