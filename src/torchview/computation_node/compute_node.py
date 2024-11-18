@@ -56,6 +56,11 @@ class TensorNode(Node):
         else:
             self.node_id = f'{id(self)}-{children_id}'
 
+def get_module_name(root_module: nn.Module, module: nn.Module) -> str:
+    for name, child in root_module.named_modules():
+        if child is module:
+            return name
+    return module.__class__.__name__
 
 class ModuleNode(Node):
     '''Subclass of node specialzed for storing torch Module info
@@ -64,6 +69,7 @@ class ModuleNode(Node):
         self,
         module_unit: nn.Module,
         depth: int,
+        root_module: nn.Module | None = None,
         parents: NodeContainer[Node] | Node | None = None,
         children: NodeContainer[Node] | Node | None = None,
         name: str = 'module-node',
@@ -73,6 +79,8 @@ class ModuleNode(Node):
         super(ModuleNode, self).__init__(
             depth, parents, children, name
         )
+        self.name = get_module_name(root_module, module_unit) if root_module else module_unit.__class__.__name__
+        self.type_name = module_unit.__class__.__name__
         self.compute_unit_id = id(module_unit)
         self.is_activation = is_generator_empty(module_unit.parameters())
         self.is_container = not any(module_unit.children())

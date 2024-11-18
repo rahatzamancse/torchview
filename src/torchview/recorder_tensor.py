@@ -120,7 +120,7 @@ def module_forward_wrapper(model_graph: ComputationGraph) -> Callable[..., Any]:
         attributes = stringify_attributes(mod) if collect_attributes else None
 
         cur_node = ModuleNode(
-            mod, cur_depth, input_nodes,  # type: ignore[arg-type]
+            mod, cur_depth, model_graph.model, input_nodes, # type: ignore
             name = type(mod).__name__,
             attributes = attributes
         )

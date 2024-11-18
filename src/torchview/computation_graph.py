@@ -1,16 +1,16 @@
 # mypy: ignore-errors
 from __future__ import annotations
 
-from typing import Union, Any, Callable
 from collections import Counter
 from contextlib import nullcontext
+from typing import Any, Callable, Union
 
+import torch.nn as nn
 from graphviz import Digraph
 from torch.nn.modules import Identity
 
-from .computation_node import NodeContainer
-from .computation_node import TensorNode, ModuleNode, FunctionNode
-from .utils import updated_dict, assert_input_type
+from .computation_node import FunctionNode, ModuleNode, NodeContainer, TensorNode
+from .utils import assert_input_type, updated_dict
 
 COMPUTATION_NODES = Union[TensorNode, ModuleNode, FunctionNode]
 
@@ -68,11 +68,13 @@ class ComputationGraph:
         roll: bool = True,
         depth: int | float = 3,
         collect_attributes: bool = False,
+        model: nn.Module | None = None,
     ):
         '''
         Resets the running_node_id, id_dict when a new ComputationGraph is initialized.
         Otherwise, labels would depend on previous ComputationGraph runs
         '''
+        self.model = model
         self.visual_graph = visual_graph
         self.root_container = root_container
         self.show_shapes = show_shapes
@@ -111,7 +113,7 @@ class ComputationGraph:
         self.edge_list: list[tuple[COMPUTATION_NODES, COMPUTATION_NODES]] = []
 
         # module node  to capture whole graph
-        main_container_module = ModuleNode(Identity(), -1)
+        main_container_module = ModuleNode(Identity(), -1, None)
         main_container_module.is_container = False
         self.subgraph_dict: dict[str, int] = {main_container_module.node_id: 0}
         self.running_subgraph_id += 1
@@ -184,7 +186,7 @@ class ComputationGraph:
             ) as cur_cont:
                 if display_nested:
                     cur_cont.attr(
-                        style='dashed', label=k.name, labeljust='l', fontsize='12'
+                        style='dashed', label=f"{k.type_name}: {k.name}", labeljust='l', fontsize='12'
                     )
                     new_kwargs = updated_dict(new_kwargs, 'subgraph', cur_cont)
                 for g in v:
