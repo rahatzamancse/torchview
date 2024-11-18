@@ -214,7 +214,7 @@ def draw_graph(
 
     model_graph = ComputationGraph(
         visual_graph, input_nodes, show_shapes, expand_nested,
-        hide_inner_tensors, hide_module_functions, roll, depth
+        hide_inner_tensors, hide_module_functions, roll, depth, model
     )
 
     forward_prop(
@@ -259,7 +259,7 @@ def forward_prop(
                 else:
                     # Should not reach this point, since process_input_data ensures
                     # x is either a list, tuple, or Mapping
-                    raise ValueError("Unknown input type")
+                    raise ValueError(f"Unknown input type: {x}")
     except Exception as e:
         raise RuntimeError(
             "Failed to run torchgraph see error message"

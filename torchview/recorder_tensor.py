@@ -113,7 +113,7 @@ def module_forward_wrapper(model_graph: ComputationGraph) -> Callable[..., Any]:
         cur_depth = next(iter(input_nodes)).depth
         input_context = next(iter(input_nodes)).context
         cur_node = ModuleNode(
-            mod, cur_depth, input_nodes,  # type: ignore[arg-type]
+            mod, cur_depth, model_graph.model, input_nodes, # type: ignore
             name=type(mod).__name__
         )
         cur_node.set_input_shape(
