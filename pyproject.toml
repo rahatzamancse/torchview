@@ -28,7 +28,9 @@ classifiers = [
 
 dependencies = [
     "graphviz",
+    "matplotlib>=3.5",
     "networkx>=3.1",
+    "numpy>=1.20",
     "pytest>=8.3.5",
     "torch>=2.5.1",
     "torchvision>=0.20.1",

@@ -457,20 +457,20 @@ class ComputationGraph:
     def to_networkx(self) -> nx.DiGraph:
         """Convert the computation graph to a NetworkX DiGraph.
         
-        Creates a hierarchical NetworkX graph where:
-        - Each node has attributes containing all relevant information
-        - Hierarchical structure is preserved via 'children' attribute on container nodes
-        - Edge information matches the visual graph
+        Creates a hierarchical NetworkX graph that exactly matches the graphviz output:
+        - Only includes visible nodes (respects hide_inner_tensors, hide_module_functions)
+        - Hierarchical structure is preserved via 'subgraph' attribute
+        - Edge information matches the visual graph exactly
         
         Returns:
-            nx.DiGraph: A NetworkX directed graph with full node/edge information.
+            nx.DiGraph: A NetworkX directed graph matching the graphviz output.
             
         Node attributes include:
             - node_type: 'tensor', 'module', or 'function'
             - name: The node's display name
             - depth: The node's depth in the hierarchy
-            - parent_id: The ID of the parent container node (if any)
-            - children: List of child node IDs (for container nodes)
+            - subgraph: The subgraph/group this node belongs to (for hierarchy)
+            - subgraph_label: Label of the containing subgraph
             - For TensorNode: tensor_shape, tensor_data (if stored), is_input, is_output
             - For ModuleNode/FunctionNode: input_shape, output_shape, is_container, 
               type_name (for modules), attributes (if collected)
@@ -479,10 +479,10 @@ class ComputationGraph:
         
         # Track node mappings: internal node_id -> networkx node id
         node_id_map: dict[str, str] = {}
-        # Track parent relationships for hierarchy
-        parent_map: dict[str, str | None] = {}
-        # Track children for container nodes
-        children_map: dict[str, list[str]] = {}
+        # Track subgraph membership
+        subgraph_stack: list[tuple[str, str]] = []  # [(subgraph_id, subgraph_label), ...]
+        # Track all subgraphs for hierarchy
+        subgraphs: dict[str, dict[str, Any]] = {}  # subgraph_id -> {label, parent, children}
         
         def get_nx_node_id(node: COMPUTATION_NODES) -> str:
             """Generate a unique, readable node ID for NetworkX."""
@@ -530,72 +530,547 @@ class ComputationGraph:
                 if node.attributes:
                     attrs['attributes'] = node.attributes
             
+            # Add subgraph info
+            if subgraph_stack:
+                attrs['subgraph'] = subgraph_stack[-1][0]
+                attrs['subgraph_label'] = subgraph_stack[-1][1]
+            else:
+                attrs['subgraph'] = None
+                attrs['subgraph_label'] = None
+            
             return attrs
         
-        def collect_all_nodes(
+        def traverse_for_networkx(
             cur_node: COMPUTATION_NODES | dict[ModuleNode, list[Any]],
-            parent_nx_id: str | None = None,
         ) -> None:
-            """Recursively collect all nodes and their hierarchy."""
+            """Traverse graph following the same logic as graphviz rendering."""
+            
+            if isinstance(cur_node, (TensorNode, ModuleNode, FunctionNode)):
+                if cur_node.depth <= self.depth:
+                    # Check if node is visible (same logic as collect_graph)
+                    is_isolated = cur_node.is_root() and cur_node.is_leaf()
+                    if id(cur_node) not in visited_nodes and not is_isolated:
+                        if self.is_node_visible(cur_node):
+                            nx_id = get_nx_node_id(cur_node)
+                            attrs = get_node_attributes(cur_node)
+                            G.add_node(nx_id, **attrs)
+                            visited_nodes.add(id(cur_node))
+                return
             
             if isinstance(cur_node, dict):
-                # Container node with children
-                container_node, children = list(cur_node.items())[0]
+                k, v = list(cur_node.items())[0]
                 
-                # Skip the root Identity container (depth -1)
-                if container_node.depth >= 0:
-                    nx_id = get_nx_node_id(container_node)
-                    attrs = get_node_attributes(container_node)
-                    attrs['is_expanded'] = True
-                    G.add_node(nx_id, **attrs)
+                # Process the container module node
+                if k.depth <= self.depth and k.depth >= 0:
+                    is_isolated = k.is_root() and k.is_leaf()
+                    if id(k) not in visited_nodes and not is_isolated:
+                        if self.is_node_visible(k):
+                            nx_id = get_nx_node_id(k)
+                            attrs = get_node_attributes(k)
+                            G.add_node(nx_id, **attrs)
+                            visited_nodes.add(id(k))
+                        elif isinstance(k, ModuleNode):
+                            # Track subgraph even if module not visible as node
+                            if k.node_id not in subgraph_ids:
+                                subgraph_ids.add(k.node_id)
+                
+                # Skip to outputs if container module with hidden functions
+                if self.hide_module_functions and k.is_container:
+                    for g in k.output_nodes:
+                        traverse_for_networkx(g)
+                    return
+                
+                # Check if we should create a subgraph (nested display)
+                display_nested = (
+                    k.depth < self.depth and k.depth >= 1 and self.expand_nested
+                )
+                
+                if display_nested:
+                    subgraph_id = f"cluster_{k.node_id}"
+                    subgraph_label = f"{k.type_name}: {k.name}"
+                    parent_subgraph = subgraph_stack[-1][0] if subgraph_stack else None
                     
-                    parent_map[nx_id] = parent_nx_id
-                    if parent_nx_id:
-                        if parent_nx_id not in children_map:
-                            children_map[parent_nx_id] = []
-                        children_map[parent_nx_id].append(nx_id)
+                    subgraphs[subgraph_id] = {
+                        'label': subgraph_label,
+                        'parent': parent_subgraph,
+                        'module_name': k.name,
+                        'module_type': k.type_name,
+                        'depth': k.depth,
+                    }
                     
-                    current_parent = nx_id
-                else:
-                    current_parent = parent_nx_id
+                    subgraph_stack.append((subgraph_id, subgraph_label))
                 
                 # Process children
-                for child in children:
-                    collect_all_nodes(child, current_parent)
-            
-            elif isinstance(cur_node, (TensorNode, ModuleNode, FunctionNode)):
-                nx_id = get_nx_node_id(cur_node)
-                attrs = get_node_attributes(cur_node)
+                for g in v:
+                    traverse_for_networkx(g)
                 
-                # Check if this is a visible leaf node (not a container with children)
-                if isinstance(cur_node, ModuleNode) and not cur_node.is_container:
-                    attrs['is_expanded'] = False
-                
-                G.add_node(nx_id, **attrs)
-                
-                parent_map[nx_id] = parent_nx_id
-                if parent_nx_id:
-                    if parent_nx_id not in children_map:
-                        children_map[parent_nx_id] = []
-                    children_map[parent_nx_id].append(nx_id)
+                if display_nested:
+                    subgraph_stack.pop()
         
-        # Collect all nodes from the hierarchy
-        collect_all_nodes(self.node_hierarchy)
+        visited_nodes: set[int] = set()
+        subgraph_ids: set[str] = set()
         
-        # Add parent and children attributes to nodes
-        for nx_id in G.nodes():
-            G.nodes[nx_id]['parent'] = parent_map.get(nx_id)
-            G.nodes[nx_id]['children'] = children_map.get(nx_id, [])
+        # Traverse the hierarchy to collect visible nodes
+        traverse_for_networkx(self.node_hierarchy)
         
-        # Add edges from edge_list
+        # Add edges from edge_list (these are already filtered to visible nodes)
+        edge_counter: dict[tuple[str, str], int] = {}
         for tail, head in self.edge_list:
             tail_nx_id = node_id_map.get(tail.node_id)
             head_nx_id = node_id_map.get(head.node_id)
             
             if tail_nx_id and head_nx_id and tail_nx_id in G and head_nx_id in G:
-                G.add_edge(tail_nx_id, head_nx_id)
+                edge_key = (tail_nx_id, head_nx_id)
+                edge_counter[edge_key] = edge_counter.get(edge_key, 0) + 1
+                G.add_edge(tail_nx_id, head_nx_id, count=edge_counter[edge_key])
+        
+        # Store subgraph hierarchy as graph attribute
+        G.graph['subgraphs'] = subgraphs
+        G.graph['settings'] = {
+            'show_shapes': self.show_shapes,
+            'expand_nested': self.expand_nested,
+            'hide_inner_tensors': self.hide_inner_tensors,
+            'hide_module_functions': self.hide_module_functions,
+            'depth': self.depth,
+        }
         
         return G
+    
+    def to_html(self, filename: str | None = None) -> str:
+        """Export the computation graph as an interactive HTML file.
+        
+        Creates an HTML file with:
+        - Interactive graph visualization using vis.js
+        - Drag and drop positioning of nodes
+        - Expand/collapse of hierarchical groups
+        - Zoom and pan navigation
+        - Node details on hover/click
+        
+        Args:
+            filename: Path to save the HTML file. If None, returns HTML string only.
+            
+        Returns:
+            str: The HTML content as a string.
+        """
+        import json
+        
+        # Get the networkx graph
+        G = self.to_networkx()
+        
+        # Prepare nodes data for vis.js
+        nodes_data = []
+        for node_id, attrs in G.nodes(data=True):
+            node_type = attrs.get('node_type', 'unknown')
+            name = attrs.get('name', node_id)
+            depth = attrs.get('depth', 0)
+            
+            # Colors matching torchview
+            colors = {
+                'tensor': {'background': '#FFFFE0', 'border': '#DAA520'},
+                'module': {'background': '#8FBC8B', 'border': '#2E8B57'},
+                'function': {'background': '#F0F8FF', 'border': '#4169E1'},
+            }
+            color = colors.get(node_type, {'background': '#FFFFFF', 'border': '#000000'})
+            
+            # Build label
+            if node_type == 'tensor':
+                shape = attrs.get('tensor_shape', ())
+                label = f"{name}\ndepth:{depth}\n{shape}"
+            elif node_type in ('module', 'function'):
+                in_shape = attrs.get('input_shape', [])
+                out_shape = attrs.get('output_shape', [])
+                in_str = str(in_shape[0]) if len(in_shape) == 1 else str(in_shape) if in_shape else ''
+                out_str = str(out_shape[0]) if len(out_shape) == 1 else str(out_shape) if out_shape else ''
+                if in_str and out_str:
+                    label = f"{name}\ndepth:{depth}\nin: {in_str}\nout: {out_str}"
+                else:
+                    label = f"{name}\ndepth:{depth}"
+            else:
+                label = name
+            
+            # Determine group (subgraph)
+            group = attrs.get('subgraph', 'root')
+            
+            node_data = {
+                'id': node_id,
+                'label': label,
+                'color': color,
+                'shape': 'box',
+                'font': {'face': 'monospace', 'size': 12},
+                'group': group if group else 'root',
+                'title': json.dumps(attrs, default=str, indent=2),  # Tooltip
+                'nodeType': node_type,
+                'depth': depth,
+            }
+            nodes_data.append(node_data)
+        
+        # Prepare edges data for vis.js
+        edges_data = []
+        for source, target, attrs in G.edges(data=True):
+            count = attrs.get('count', 1)
+            edge_data = {
+                'from': source,
+                'to': target,
+                'arrows': 'to',
+                'color': {'color': '#666666'},
+            }
+            if count > 1:
+                edge_data['label'] = f'x{count}'
+            edges_data.append(edge_data)
+        
+        # Prepare groups (subgraphs) for clustering
+        subgraphs = G.graph.get('subgraphs', {})
+        groups_data = {'root': {'color': {'background': '#FAFAFA'}}}
+        for sg_id, sg_info in subgraphs.items():
+            groups_data[sg_id] = {
+                'color': {'background': '#F5F5F5', 'border': '#CCCCCC'},
+            }
+        
+        # Generate HTML
+        html_content = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TorchView - Interactive Computation Graph</title>
+    <script src="https://unpkg.com/vis-data@7.1.9/peer/umd/vis-data.min.js"></script>
+    <script src="https://unpkg.com/vis-network@9.1.9/peer/umd/vis-network.min.js"></script>
+    <link href="https://unpkg.com/vis-network@9.1.9/styles/vis-network.min.css" rel="stylesheet">
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+        }}
+        #container {{
+            display: flex;
+            height: 100vh;
+        }}
+        #graph-container {{
+            flex: 1;
+            background: #16213e;
+            position: relative;
+        }}
+        #network {{
+            width: 100%;
+            height: 100%;
+        }}
+        #sidebar {{
+            width: 320px;
+            background: #0f3460;
+            padding: 20px;
+            overflow-y: auto;
+            border-left: 2px solid #e94560;
+        }}
+        h1 {{
+            font-size: 1.4em;
+            margin-bottom: 15px;
+            color: #e94560;
+            border-bottom: 1px solid #e94560;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            font-size: 1.1em;
+            margin: 15px 0 10px;
+            color: #00fff5;
+        }}
+        .info-section {{
+            background: #1a1a2e;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 15px;
+        }}
+        .stat {{
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #333;
+        }}
+        .stat:last-child {{
+            border-bottom: none;
+        }}
+        .stat-label {{
+            color: #888;
+        }}
+        .stat-value {{
+            color: #00fff5;
+            font-weight: bold;
+        }}
+        #node-details {{
+            font-family: monospace;
+            font-size: 11px;
+            white-space: pre-wrap;
+            background: #1a1a2e;
+            padding: 10px;
+            border-radius: 8px;
+            max-height: 300px;
+            overflow-y: auto;
+        }}
+        .legend {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 10px;
+        }}
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+        }}
+        .legend-color {{
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            border: 2px solid;
+        }}
+        .controls {{
+            margin-top: 15px;
+        }}
+        button {{
+            background: #e94560;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px 5px 5px 0;
+            font-size: 12px;
+            transition: background 0.3s;
+        }}
+        button:hover {{
+            background: #ff6b6b;
+        }}
+        .group-list {{
+            max-height: 200px;
+            overflow-y: auto;
+        }}
+        .group-item {{
+            padding: 5px 10px;
+            margin: 3px 0;
+            background: #1a1a2e;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.2s;
+        }}
+        .group-item:hover {{
+            background: #2a2a4e;
+        }}
+        .group-item.collapsed {{
+            opacity: 0.6;
+        }}
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="graph-container">
+            <div id="network"></div>
+        </div>
+        <div id="sidebar">
+            <h1>🔥 TorchView Graph</h1>
+            
+            <div class="info-section">
+                <h2>📊 Statistics</h2>
+                <div class="stat">
+                    <span class="stat-label">Total Nodes</span>
+                    <span class="stat-value" id="node-count">{G.number_of_nodes()}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Total Edges</span>
+                    <span class="stat-value" id="edge-count">{G.number_of_edges()}</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Subgraphs</span>
+                    <span class="stat-value">{len(subgraphs)}</span>
+                </div>
+            </div>
+            
+            <div class="info-section">
+                <h2>🎨 Legend</h2>
+                <div class="legend">
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #FFFFE0; border-color: #DAA520;"></div>
+                        <span>Tensor</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #8FBC8B; border-color: #2E8B57;"></div>
+                        <span>Module</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color" style="background: #F0F8FF; border-color: #4169E1;"></div>
+                        <span>Function</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="info-section">
+                <h2>🎮 Controls</h2>
+                <div class="controls">
+                    <button onclick="fitNetwork()">Fit to Screen</button>
+                    <button onclick="resetLayout()">Reset Layout</button>
+                    <button onclick="togglePhysics()">Toggle Physics</button>
+                </div>
+            </div>
+            
+            <div class="info-section">
+                <h2>📁 Module Groups</h2>
+                <div class="group-list" id="group-list"></div>
+            </div>
+            
+            <div class="info-section">
+                <h2>📋 Node Details</h2>
+                <div id="node-details">Click on a node to see details...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Graph data
+        const nodesData = {json.dumps(nodes_data)};
+        const edgesData = {json.dumps(edges_data)};
+        const subgraphs = {json.dumps(subgraphs)};
+        
+        // Create vis.js datasets
+        const nodes = new vis.DataSet(nodesData);
+        const edges = new vis.DataSet(edgesData);
+        
+        // Network options
+        const options = {{
+            layout: {{
+                hierarchical: {{
+                    enabled: true,
+                    direction: 'UD',
+                    sortMethod: 'directed',
+                    levelSeparation: 100,
+                    nodeSpacing: 150,
+                    treeSpacing: 200,
+                    blockShifting: true,
+                    edgeMinimization: true,
+                    parentCentralization: true,
+                }}
+            }},
+            physics: {{
+                enabled: false,
+            }},
+            interaction: {{
+                hover: true,
+                tooltipDelay: 200,
+                multiselect: true,
+                navigationButtons: true,
+            }},
+            edges: {{
+                smooth: {{
+                    type: 'cubicBezier',
+                    forceDirection: 'vertical',
+                }},
+            }},
+            nodes: {{
+                borderWidth: 2,
+                shadow: true,
+            }},
+        }};
+        
+        // Create network
+        const container = document.getElementById('network');
+        const network = new vis.Network(container, {{ nodes, edges }}, options);
+        
+        // Track physics state
+        let physicsEnabled = false;
+        
+        // Populate group list
+        const groupList = document.getElementById('group-list');
+        const collapsedGroups = new Set();
+        
+        Object.entries(subgraphs).forEach(([sgId, sgInfo]) => {{
+            const div = document.createElement('div');
+            div.className = 'group-item';
+            div.textContent = sgInfo.label;
+            div.onclick = () => toggleGroup(sgId, div);
+            groupList.appendChild(div);
+        }});
+        
+        // Node click handler
+        network.on('click', function(params) {{
+            if (params.nodes.length > 0) {{
+                const nodeId = params.nodes[0];
+                const node = nodes.get(nodeId);
+                const details = JSON.parse(node.title);
+                document.getElementById('node-details').textContent = 
+                    JSON.stringify(details, null, 2);
+            }}
+        }});
+        
+        // Functions
+        function fitNetwork() {{
+            network.fit({{ animation: true }});
+        }}
+        
+        function resetLayout() {{
+            // Re-enable hierarchical layout temporarily
+            network.setOptions({{
+                layout: {{
+                    hierarchical: {{
+                        enabled: true,
+                    }}
+                }}
+            }});
+            setTimeout(() => {{
+                network.setOptions({{
+                    layout: {{
+                        hierarchical: {{
+                            enabled: false,
+                        }}
+                    }}
+                }});
+            }}, 100);
+        }}
+        
+        function togglePhysics() {{
+            physicsEnabled = !physicsEnabled;
+            network.setOptions({{
+                physics: {{ enabled: physicsEnabled }}
+            }});
+        }}
+        
+        function toggleGroup(groupId, element) {{
+            const groupNodes = nodesData.filter(n => n.group === groupId).map(n => n.id);
+            
+            if (collapsedGroups.has(groupId)) {{
+                // Expand
+                collapsedGroups.delete(groupId);
+                element.classList.remove('collapsed');
+                groupNodes.forEach(nodeId => {{
+                    nodes.update({{ id: nodeId, hidden: false }});
+                }});
+            }} else {{
+                // Collapse
+                collapsedGroups.add(groupId);
+                element.classList.add('collapsed');
+                groupNodes.forEach(nodeId => {{
+                    nodes.update({{ id: nodeId, hidden: true }});
+                }});
+            }}
+        }}
+        
+        // Initial fit
+        network.once('stabilizationIterationsDone', function() {{
+            network.fit();
+        }});
+    </script>
+</body>
+</html>'''
+        
+        if filename:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+        
+        return html_content
 
     @staticmethod
     def get_node_color(
