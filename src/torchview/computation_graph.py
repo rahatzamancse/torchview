@@ -10,6 +10,7 @@ from graphviz import Digraph
 from torch.nn.modules import Identity
 
 from .computation_node import FunctionNode, ModuleNode, NodeContainer, TensorNode
+from .computation_node.compute_node import DEFAULT_MAX_TENSOR_BYTES
 from .utils import assert_input_type, updated_dict
 
 COMPUTATION_NODES = Union[TensorNode, ModuleNode, FunctionNode]
@@ -26,6 +27,13 @@ node2color = {
 
 # TODO: change api of to include also function calls, not only pytorch models
 # so, keep the api here as general as possible
+
+
+def build_module_name_map(model: nn.Module) -> dict[int, str]:
+    '''Build a mapping from module id to its full path name.
+    This is O(n) once, enabling O(1) lookups for each module.
+    '''
+    return {id(mod): name for name, mod in model.named_modules()}
 
 
 class ComputationGraph:
@@ -69,12 +77,23 @@ class ComputationGraph:
         depth: int | float = 3,
         collect_attributes: bool = False,
         model: nn.Module | None = None,
+        store_tensor_data: bool = False,
+        max_tensor_bytes: int = DEFAULT_MAX_TENSOR_BYTES,
     ):
         '''
         Resets the running_node_id, id_dict when a new ComputationGraph is initialized.
         Otherwise, labels would depend on previous ComputationGraph runs
         '''
-        self.model = model
+        # Build module name map once for O(1) lookups
+        if model:
+            self.module_name_map: dict[int, str] = build_module_name_map(model)
+        else:
+            self.module_name_map = {}
+
+        # Tensor storage settings
+        self.store_tensor_data = store_tensor_data
+        self.max_tensor_bytes = max_tensor_bytes
+
         self.visual_graph = visual_graph
         self.root_container = root_container
         self.show_shapes = show_shapes
@@ -105,6 +124,8 @@ class ComputationGraph:
             'current_context': [],
             'current_depth': 0,
             'collect_attributes': self.collect_attributes,
+            'store_tensor_data': self.store_tensor_data,
+            'max_tensor_bytes': self.max_tensor_bytes,
         }
         self.running_node_id: int = 0
         self.running_subgraph_id: int = 0
@@ -112,8 +133,8 @@ class ComputationGraph:
         self.node_set: set[int] = set()
         self.edge_list: list[tuple[COMPUTATION_NODES, COMPUTATION_NODES]] = []
 
-        # module node  to capture whole graph
-        main_container_module = ModuleNode(Identity(), -1, None)
+        # module node to capture whole graph
+        main_container_module = ModuleNode(Identity(), -1)
         main_container_module.is_container = False
         self.subgraph_dict: dict[str, int] = {main_container_module.node_id: 0}
         self.running_subgraph_id += 1

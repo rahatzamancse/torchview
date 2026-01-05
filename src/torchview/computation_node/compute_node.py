@@ -6,9 +6,13 @@ from collections.abc import Callable
 import torch
 from torch import nn
 import numpy as np
+import warnings
 
 from .base_node import Node, NodeContainer
 from ..utils import is_generator_empty
+
+# Default maximum tensor size in bytes (100 MB)
+DEFAULT_MAX_TENSOR_BYTES = 100 * 1024 * 1024
 
 
 class TensorNode(Node):
@@ -27,6 +31,8 @@ class TensorNode(Node):
         main_node: TensorNode | None = None,
         parent_hierarchy: dict[int, ModuleNode | FunctionNode] | None = None,
         collect_attributes: bool = False,
+        store_tensor_data: bool = False,
+        max_tensor_bytes: int = DEFAULT_MAX_TENSOR_BYTES,
     ):
 
         super(TensorNode, self).__init__(
@@ -34,18 +40,42 @@ class TensorNode(Node):
         )
         self.tensor_id = id(tensor)
         self.name = name
-        # Convert tensor to regular Tensor before detaching and converting to numpy
-        regular_tensor = tensor.as_subclass(torch.Tensor)
-        self.tensor_data: np.ndarray = regular_tensor.detach().cpu().numpy()
+
+        # Store tensor shape (always needed)
+        self._tensor_shape: tuple[int, ...] = tuple(tensor.shape)
+
+        # Optionally store full tensor data with memory limit
+        self.tensor_data: np.ndarray | None = None
+        if store_tensor_data:
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if tensor_bytes <= max_tensor_bytes:
+                # Convert tensor to regular Tensor before detaching and converting to numpy
+                regular_tensor = tensor.as_subclass(torch.Tensor)
+                self.tensor_data = regular_tensor.detach().cpu().numpy()
+            else:
+                warnings.warn(
+                    f"Tensor data for node '{self.name}' (id={self.tensor_id}, shape={self._tensor_shape}) "
+                    f"exceeds the memory limit of {max_tensor_bytes} bytes. "
+                    f"Tensor data will not be stored.",
+                    RuntimeWarning
+                )
+        
         self.is_aux = is_aux
         self.main_node = self if main_node is None else main_node
         self.context = [] if context is None else context
         self.parent_hierarchy = {} if parent_hierarchy is None else parent_hierarchy
         self.set_node_id()
         self.collect_attributes = collect_attributes
-        
+        # Store settings for propagation through graph
+        self.store_tensor_data = store_tensor_data
+        self.max_tensor_bytes = max_tensor_bytes
+
     def get_tensor_shape(self) -> tuple[int, ...]:
-        return tuple(self.tensor_data.shape)
+        return self._tensor_shape
+
+    def has_tensor_data(self) -> bool:
+        '''Returns True if full tensor data is stored'''
+        return self.tensor_data is not None
 
     def set_node_id(self, children_id: int | str | None = None) -> None:
         if children_id is None:
@@ -56,12 +86,6 @@ class TensorNode(Node):
         else:
             self.node_id = f'{id(self)}-{children_id}'
 
-def get_module_name(root_module: nn.Module, module: nn.Module) -> str:
-    for name, child in root_module.named_modules():
-        if child is module:
-            return name
-    return module.__class__.__name__
-
 class ModuleNode(Node):
     '''Subclass of node specialzed for storing torch Module info
     '''
@@ -69,18 +93,21 @@ class ModuleNode(Node):
         self,
         module_unit: nn.Module,
         depth: int,
-        root_module: nn.Module | None = None,
+        module_name_map: dict[int, str] | None = None,
         parents: NodeContainer[Node] | Node | None = None,
         children: NodeContainer[Node] | Node | None = None,
-        name: str = 'module-node',
         output_nodes: NodeContainer[Node] | None = None,
         attributes: Optional[str] = None,
     ) -> None:
         super(ModuleNode, self).__init__(
-            depth, parents, children, name
+            depth, parents, children, name='module-node'
         )
-        self.name = get_module_name(root_module, module_unit) if root_module else module_unit.__class__.__name__
+        # Use precomputed module name map for O(1) lookup instead of O(n) iteration
         self.type_name = module_unit.__class__.__name__
+        if module_name_map is not None:
+            self.name = module_name_map.get(id(module_unit), self.type_name)
+        else:
+            self.name = self.type_name
         self.compute_unit_id = id(module_unit)
         self.is_activation = is_generator_empty(module_unit.parameters())
         self.is_container = not any(module_unit.children())

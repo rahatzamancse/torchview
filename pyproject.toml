@@ -26,7 +26,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
 ]
 
-dependencies = ["graphviz"]
+dependencies = [
+    "graphviz",
+    "pytest>=8.3.5",
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+]
 
 [build-system]
 requires = ["flit_core<4"]
