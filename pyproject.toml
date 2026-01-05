@@ -28,6 +28,7 @@ classifiers = [
 
 dependencies = [
     "graphviz",
+    "networkx>=3.1",
     "pytest>=8.3.5",
     "torch>=2.5.1",
     "torchvision>=0.20.1",
@@ -89,6 +90,7 @@ module = [
     'transformers',
     'mkdocs_gen_files',
     'pytest',
+    'networkx',
 ]
 ignore_missing_imports = true
 

@@ -16,12 +16,13 @@ Features demonstrated:
 7. Recursive module rolling (roll)
 8. Graph direction (graph_dir)
 9. Attribute collection (collect_attributes)
-10. Tensor data storage (store_tensor_data) - NEW
-11. Memory limits (max_tensor_bytes) - NEW
+10. Tensor data storage (store_tensor_data)
+11. Memory limits (max_tensor_bytes)
 12. Module name mapping (full path names)
 13. Graph export and saving
 14. Multiple inputs handling
 15. Programmatic graph traversal
+16. NetworkX export (hierarchical graph)
 """
 
 from __future__ import annotations
@@ -842,6 +843,98 @@ def demo_transformer_model():
     return graph
 
 
+def demo_networkx_export():
+    """16. NetworkX hierarchical graph export."""
+    print("\n" + "="*60)
+    print("16. NETWORKX HIERARCHICAL GRAPH EXPORT")
+    print("="*60)
+    
+    try:
+        import networkx as nx
+    except ImportError:
+        print("⚠ NetworkX not installed. Skipping this demo.")
+        print("  Install with: pip install networkx")
+        return None
+    
+    model = BranchedMLP()
+    
+    # Create the computation graph with expanded nested modules
+    graph = draw_graph(
+        model,
+        input_size=(1, 10),
+        graph_name="BranchedMLP_networkx",
+        expand_nested=True,
+        depth=10,
+        store_tensor_data=True,  # Include tensor data in nodes
+    )
+    
+    # Convert to NetworkX graph
+    nx_graph = graph.to_networkx()
+    
+    print("✓ Converted computation graph to NetworkX DiGraph")
+    print(f"\n  Graph Statistics:")
+    print(f"    - Number of nodes: {nx_graph.number_of_nodes()}")
+    print(f"    - Number of edges: {nx_graph.number_of_edges()}")
+    
+    # Count node types
+    node_types = {}
+    for node_id, attrs in nx_graph.nodes(data=True):
+        node_type = attrs.get('node_type', 'unknown')
+        node_types[node_type] = node_types.get(node_type, 0) + 1
+    
+    print(f"\n  Node types:")
+    for node_type, count in node_types.items():
+        print(f"    - {node_type}: {count}")
+    
+    # Show hierarchy structure
+    print(f"\n  Hierarchical structure (sample):")
+    root_nodes = [n for n, d in nx_graph.nodes(data=True) if d.get('parent') is None]
+    
+    def print_hierarchy(node_id, indent=0):
+        attrs = nx_graph.nodes[node_id]
+        node_type = attrs.get('node_type', '?')
+        name = attrs.get('name', node_id)
+        children = attrs.get('children', [])
+        
+        type_symbol = {'module': '📦', 'function': '⚙️', 'tensor': '📊'}.get(node_type, '?')
+        print(f"    {'  ' * indent}{type_symbol} {name} ({node_type})")
+        
+        # Only show first 3 children for brevity
+        for child_id in children[:3]:
+            print_hierarchy(child_id, indent + 1)
+        if len(children) > 3:
+            print(f"    {'  ' * (indent + 1)}... and {len(children) - 3} more")
+    
+    for root in root_nodes[:2]:  # Show first 2 root nodes
+        print_hierarchy(root)
+    
+    # Show sample node attributes
+    print(f"\n  Sample node attributes:")
+    for node_id, attrs in list(nx_graph.nodes(data=True))[:3]:
+        print(f"\n    Node: {node_id}")
+        for key, value in attrs.items():
+            if key == 'tensor_data':
+                print(f"      {key}: <numpy array shape={value.shape}>")
+            elif key == 'children' and len(value) > 3:
+                print(f"      {key}: [{value[0]}, {value[1]}, ... ({len(value)} total)]")
+            else:
+                print(f"      {key}: {value}")
+    
+    # Demonstrate some NetworkX analysis
+    print(f"\n  NetworkX analysis:")
+    print(f"    - Is DAG: {nx.is_directed_acyclic_graph(nx_graph)}")
+    
+    # Find input and output nodes
+    input_nodes = [n for n, d in nx_graph.nodes(data=True) 
+                   if d.get('node_type') == 'tensor' and d.get('is_input')]
+    output_nodes = [n for n, d in nx_graph.nodes(data=True) 
+                    if d.get('node_type') == 'tensor' and d.get('is_output')]
+    print(f"    - Input tensor nodes: {len(input_nodes)}")
+    print(f"    - Output tensor nodes: {len(output_nodes)}")
+    
+    return nx_graph
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -868,15 +961,17 @@ def main():
     demo_multiple_inputs()
     demo_programmatic_traversal()
     demo_transformer_model()
+    demo_networkx_export()
     
     print("\n" + "=" * 60)
     print("   ALL DEMOS COMPLETED!")
     print("=" * 60)
     print(f"\nCheck {OUTPUT_DIR} for generated visualizations.")
-    print("\nKey new features demonstrated:")
+    print("\nKey features demonstrated:")
     print("  • store_tensor_data: Store full tensor values for debugging")
     print("  • max_tensor_bytes: Control memory usage for tensor storage")
     print("  • Module name mapping: Full path names like 'features.0' instead of 'Conv2d'")
+    print("  • to_networkx(): Export as hierarchical NetworkX graph for analysis")
 
 
 if __name__ == "__main__":

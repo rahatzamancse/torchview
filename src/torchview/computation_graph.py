@@ -13,6 +13,8 @@ from .computation_node import FunctionNode, ModuleNode, NodeContainer, TensorNod
 from .computation_node.compute_node import DEFAULT_MAX_TENSOR_BYTES
 from .utils import assert_input_type, updated_dict
 
+import networkx as nx
+
 COMPUTATION_NODES = Union[TensorNode, ModuleNode, FunctionNode]
 
 node2color = {
@@ -451,6 +453,149 @@ class ComputationGraph:
         size = scale * max(min_size, content_size)
         size_str = str(size) + "," + str(size)
         self.visual_graph.graph_attr.update(size=size_str,)
+
+    def to_networkx(self) -> nx.DiGraph:
+        """Convert the computation graph to a NetworkX DiGraph.
+        
+        Creates a hierarchical NetworkX graph where:
+        - Each node has attributes containing all relevant information
+        - Hierarchical structure is preserved via 'children' attribute on container nodes
+        - Edge information matches the visual graph
+        
+        Returns:
+            nx.DiGraph: A NetworkX directed graph with full node/edge information.
+            
+        Node attributes include:
+            - node_type: 'tensor', 'module', or 'function'
+            - name: The node's display name
+            - depth: The node's depth in the hierarchy
+            - parent_id: The ID of the parent container node (if any)
+            - children: List of child node IDs (for container nodes)
+            - For TensorNode: tensor_shape, tensor_data (if stored), is_input, is_output
+            - For ModuleNode/FunctionNode: input_shape, output_shape, is_container, 
+              type_name (for modules), attributes (if collected)
+        """
+        G = nx.DiGraph()
+        
+        # Track node mappings: internal node_id -> networkx node id
+        node_id_map: dict[str, str] = {}
+        # Track parent relationships for hierarchy
+        parent_map: dict[str, str | None] = {}
+        # Track children for container nodes
+        children_map: dict[str, list[str]] = {}
+        
+        def get_nx_node_id(node: COMPUTATION_NODES) -> str:
+            """Generate a unique, readable node ID for NetworkX."""
+            if node.node_id in node_id_map:
+                return node_id_map[node.node_id]
+            
+            # Create readable ID based on node type and name
+            base_id = f"{node.name}_{len(node_id_map)}"
+            node_id_map[node.node_id] = base_id
+            return base_id
+        
+        def get_node_attributes(node: COMPUTATION_NODES) -> dict[str, Any]:
+            """Extract all relevant attributes from a computation node."""
+            attrs: dict[str, Any] = {
+                'name': node.name,
+                'depth': node.depth,
+                'internal_id': node.node_id,
+            }
+            
+            if isinstance(node, TensorNode):
+                attrs['node_type'] = 'tensor'
+                attrs['tensor_shape'] = node.get_tensor_shape()
+                attrs['is_input'] = node.is_root()
+                attrs['is_output'] = node.is_leaf()
+                attrs['is_aux'] = node.is_aux
+                if node.has_tensor_data():
+                    attrs['tensor_data'] = node.tensor_data
+            
+            elif isinstance(node, ModuleNode):
+                attrs['node_type'] = 'module'
+                attrs['type_name'] = node.type_name
+                attrs['input_shape'] = node.input_shape
+                attrs['output_shape'] = node.output_shape
+                attrs['is_container'] = node.is_container
+                attrs['is_activation'] = node.is_activation
+                attrs['compute_unit_id'] = node.compute_unit_id
+                if node.attributes:
+                    attrs['attributes'] = node.attributes
+            
+            elif isinstance(node, FunctionNode):
+                attrs['node_type'] = 'function'
+                attrs['input_shape'] = node.input_shape
+                attrs['output_shape'] = node.output_shape
+                attrs['compute_unit_id'] = node.compute_unit_id
+                if node.attributes:
+                    attrs['attributes'] = node.attributes
+            
+            return attrs
+        
+        def collect_all_nodes(
+            cur_node: COMPUTATION_NODES | dict[ModuleNode, list[Any]],
+            parent_nx_id: str | None = None,
+        ) -> None:
+            """Recursively collect all nodes and their hierarchy."""
+            
+            if isinstance(cur_node, dict):
+                # Container node with children
+                container_node, children = list(cur_node.items())[0]
+                
+                # Skip the root Identity container (depth -1)
+                if container_node.depth >= 0:
+                    nx_id = get_nx_node_id(container_node)
+                    attrs = get_node_attributes(container_node)
+                    attrs['is_expanded'] = True
+                    G.add_node(nx_id, **attrs)
+                    
+                    parent_map[nx_id] = parent_nx_id
+                    if parent_nx_id:
+                        if parent_nx_id not in children_map:
+                            children_map[parent_nx_id] = []
+                        children_map[parent_nx_id].append(nx_id)
+                    
+                    current_parent = nx_id
+                else:
+                    current_parent = parent_nx_id
+                
+                # Process children
+                for child in children:
+                    collect_all_nodes(child, current_parent)
+            
+            elif isinstance(cur_node, (TensorNode, ModuleNode, FunctionNode)):
+                nx_id = get_nx_node_id(cur_node)
+                attrs = get_node_attributes(cur_node)
+                
+                # Check if this is a visible leaf node (not a container with children)
+                if isinstance(cur_node, ModuleNode) and not cur_node.is_container:
+                    attrs['is_expanded'] = False
+                
+                G.add_node(nx_id, **attrs)
+                
+                parent_map[nx_id] = parent_nx_id
+                if parent_nx_id:
+                    if parent_nx_id not in children_map:
+                        children_map[parent_nx_id] = []
+                    children_map[parent_nx_id].append(nx_id)
+        
+        # Collect all nodes from the hierarchy
+        collect_all_nodes(self.node_hierarchy)
+        
+        # Add parent and children attributes to nodes
+        for nx_id in G.nodes():
+            G.nodes[nx_id]['parent'] = parent_map.get(nx_id)
+            G.nodes[nx_id]['children'] = children_map.get(nx_id, [])
+        
+        # Add edges from edge_list
+        for tail, head in self.edge_list:
+            tail_nx_id = node_id_map.get(tail.node_id)
+            head_nx_id = node_id_map.get(head.node_id)
+            
+            if tail_nx_id and head_nx_id and tail_nx_id in G and head_nx_id in G:
+                G.add_edge(tail_nx_id, head_nx_id)
+        
+        return G
 
     @staticmethod
     def get_node_color(
