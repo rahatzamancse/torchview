@@ -461,6 +461,7 @@ class ComputationGraph:
         - Only includes visible nodes (respects hide_inner_tensors, hide_module_functions)
         - Hierarchical structure is preserved via 'subgraph' attribute
         - Edge information matches the visual graph exactly
+        - Rolled modules share the same node ID (matching graphviz behavior)
         
         Returns:
             nx.DiGraph: A NetworkX directed graph matching the graphviz output.
@@ -474,24 +475,35 @@ class ComputationGraph:
             - For TensorNode: tensor_shape, tensor_data (if stored), is_input, is_output
             - For ModuleNode/FunctionNode: input_shape, output_shape, is_container, 
               type_name (for modules), attributes (if collected)
+        
+        Edge attributes include:
+            - count: Number of times this edge appears (for rolled graphs, shown as "x{count}")
         """
         G = nx.DiGraph()
         
-        # Track node mappings: internal node_id -> networkx node id
-        node_id_map: dict[str, str] = {}
+        # Use the same id_dict that graphviz uses - this handles rolled modules correctly
+        # node.node_id -> integer id (rolled modules have same node_id after rollify())
+        # Maps integer id -> networkx node string id
+        int_id_to_nx_id: dict[int, str] = {}
+        
         # Track subgraph membership
         subgraph_stack: list[tuple[str, str]] = []  # [(subgraph_id, subgraph_label), ...]
         # Track all subgraphs for hierarchy
         subgraphs: dict[str, dict[str, Any]] = {}  # subgraph_id -> {label, parent, children}
         
-        def get_nx_node_id(node: COMPUTATION_NODES) -> str:
-            """Generate a unique, readable node ID for NetworkX."""
-            if node.node_id in node_id_map:
-                return node_id_map[node.node_id]
+        def get_nx_node_id(node: COMPUTATION_NODES) -> str | None:
+            """Get NetworkX node ID using the same mapping as graphviz."""
+            # Use id_dict which is set by graphviz rendering (handles rolled modules)
+            if node.node_id not in self.id_dict:
+                return None
+            
+            int_id = self.id_dict[node.node_id]
+            if int_id in int_id_to_nx_id:
+                return int_id_to_nx_id[int_id]
             
             # Create readable ID based on node type and name
-            base_id = f"{node.name}_{len(node_id_map)}"
-            node_id_map[node.node_id] = base_id
+            base_id = f"{node.name}_{int_id}"
+            int_id_to_nx_id[int_id] = base_id
             return base_id
         
         def get_node_attributes(node: COMPUTATION_NODES) -> dict[str, Any]:
@@ -500,6 +512,7 @@ class ComputationGraph:
                 'name': node.name,
                 'depth': node.depth,
                 'internal_id': node.node_id,
+                'graphviz_id': self.id_dict.get(node.node_id),
             }
             
             if isinstance(node, TensorNode):
@@ -549,12 +562,12 @@ class ComputationGraph:
                 if cur_node.depth <= self.depth:
                     # Check if node is visible (same logic as collect_graph)
                     is_isolated = cur_node.is_root() and cur_node.is_leaf()
-                    if id(cur_node) not in visited_nodes and not is_isolated:
+                    if not is_isolated:
                         if self.is_node_visible(cur_node):
                             nx_id = get_nx_node_id(cur_node)
-                            attrs = get_node_attributes(cur_node)
-                            G.add_node(nx_id, **attrs)
-                            visited_nodes.add(id(cur_node))
+                            if nx_id and nx_id not in G:
+                                attrs = get_node_attributes(cur_node)
+                                G.add_node(nx_id, **attrs)
                 return
             
             if isinstance(cur_node, dict):
@@ -563,16 +576,12 @@ class ComputationGraph:
                 # Process the container module node
                 if k.depth <= self.depth and k.depth >= 0:
                     is_isolated = k.is_root() and k.is_leaf()
-                    if id(k) not in visited_nodes and not is_isolated:
+                    if not is_isolated:
                         if self.is_node_visible(k):
                             nx_id = get_nx_node_id(k)
-                            attrs = get_node_attributes(k)
-                            G.add_node(nx_id, **attrs)
-                            visited_nodes.add(id(k))
-                        elif isinstance(k, ModuleNode):
-                            # Track subgraph even if module not visible as node
-                            if k.node_id not in subgraph_ids:
-                                subgraph_ids.add(k.node_id)
+                            if nx_id and nx_id not in G:
+                                attrs = get_node_attributes(k)
+                                G.add_node(nx_id, **attrs)
                 
                 # Skip to outputs if container module with hidden functions
                 if self.hide_module_functions and k.is_container:
@@ -590,13 +599,15 @@ class ComputationGraph:
                     subgraph_label = f"{k.type_name}: {k.name}"
                     parent_subgraph = subgraph_stack[-1][0] if subgraph_stack else None
                     
-                    subgraphs[subgraph_id] = {
-                        'label': subgraph_label,
-                        'parent': parent_subgraph,
-                        'module_name': k.name,
-                        'module_type': k.type_name,
-                        'depth': k.depth,
-                    }
+                    # Only add if not already present (handles rolled modules)
+                    if subgraph_id not in subgraphs:
+                        subgraphs[subgraph_id] = {
+                            'label': subgraph_label,
+                            'parent': parent_subgraph,
+                            'module_name': k.name,
+                            'module_type': k.type_name,
+                            'depth': k.depth,
+                        }
                     
                     subgraph_stack.append((subgraph_id, subgraph_label))
                 
@@ -607,24 +618,32 @@ class ComputationGraph:
                 if display_nested:
                     subgraph_stack.pop()
         
-        visited_nodes: set[int] = set()
-        subgraph_ids: set[str] = set()
-        
         # Traverse the hierarchy to collect visible nodes
         traverse_for_networkx(self.node_hierarchy)
         
-        # Add edges from edge_list (these are already filtered to visible nodes)
+        # Add edges from edge_list using the same id mapping as graphviz
+        # This handles rolled modules correctly - same node_id = same edge endpoint
         edge_counter: dict[tuple[str, str], int] = {}
         for tail, head in self.edge_list:
-            tail_nx_id = node_id_map.get(tail.node_id)
-            head_nx_id = node_id_map.get(head.node_id)
+            # Use graphviz id_dict to get integer IDs (handles rolled modules)
+            tail_int_id = self.id_dict.get(tail.node_id)
+            head_int_id = self.id_dict.get(head.node_id)
+            
+            if tail_int_id is None or head_int_id is None:
+                continue
+            
+            tail_nx_id = int_id_to_nx_id.get(tail_int_id)
+            head_nx_id = int_id_to_nx_id.get(head_int_id)
             
             if tail_nx_id and head_nx_id and tail_nx_id in G and head_nx_id in G:
                 edge_key = (tail_nx_id, head_nx_id)
                 edge_counter[edge_key] = edge_counter.get(edge_key, 0) + 1
-                G.add_edge(tail_nx_id, head_nx_id, count=edge_counter[edge_key])
         
-        # Store subgraph hierarchy as graph attribute
+        # Add edges with final counts (matching graphviz which shows "x{count}")
+        for (tail_nx_id, head_nx_id), count in edge_counter.items():
+            G.add_edge(tail_nx_id, head_nx_id, count=count)
+        
+        # Store subgraph hierarchy and settings as graph attributes
         G.graph['subgraphs'] = subgraphs
         G.graph['settings'] = {
             'show_shapes': self.show_shapes,
@@ -632,6 +651,7 @@ class ComputationGraph:
             'hide_inner_tensors': self.hide_inner_tensors,
             'hide_module_functions': self.hide_module_functions,
             'depth': self.depth,
+            'roll': self.roll,
         }
         
         return G
