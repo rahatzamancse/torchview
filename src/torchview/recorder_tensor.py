@@ -76,7 +76,7 @@ def creation_ops_wrapper(
         current_context = model_graph.context_tracker['current_context']
         collect_attributes = model_graph.context_tracker['collect_attributes']
         store_tensor_data = model_graph.context_tracker['store_tensor_data']
-        max_tensor_bytes = model_graph.context_tracker['max_tensor_bytes']
+        tensor_store = model_graph.context_tracker['tensor_store']
 
         input_recorder_tensor: RecorderTensor = input_tensor.as_subclass(RecorderTensor)
         input_node = TensorNode(
@@ -86,7 +86,7 @@ def creation_ops_wrapper(
             context=current_context,
             collect_attributes=collect_attributes, # type: ignore[arg-type]
             store_tensor_data=store_tensor_data,
-            max_tensor_bytes=max_tensor_bytes,
+            tensor_store=tensor_store,
         )
         current_context.append(input_node)  # type: ignore[attr-defined]
         input_recorder_tensor.tensor_nodes = [input_node]
@@ -140,12 +140,12 @@ def module_forward_wrapper(model_graph: ComputationGraph) -> Callable[..., Any]:
             reduce_data_info([args, kwargs], collect_tensor_node_id_dict, {})
         )
         store_tensor_data = model_graph.context_tracker['store_tensor_data']
-        max_tensor_bytes = model_graph.context_tracker['max_tensor_bytes']
+        tensor_store = model_graph.context_tracker['tensor_store']
         attach_kwargs = {
             'parents': cur_node, 'depth': cur_depth+1,
             'context': input_context[-1][cur_node], 'is_aux': True,
             'name': 'auxiliary-tensor', 'collect_attributes': collect_attributes,
-            'store_tensor_data': store_tensor_data, 'max_tensor_bytes': max_tensor_bytes
+            'store_tensor_data': store_tensor_data, 'tensor_store': tensor_store
         }
 
         traverse_data_inplace(
@@ -283,13 +283,13 @@ class RecorderTensor(torch.Tensor):
 
         input_context.append(cur_node)
         store_tensor_data = next(iter(args_nodes)).store_tensor_data
-        max_tensor_bytes = next(iter(args_nodes)).max_tensor_bytes
+        tensor_store = next(iter(args_nodes))._tensor_store
         attach_kwargs = {
             'parents': cur_node, 'depth': cur_depth, "context": input_context,
             'is_aux': False, 'parent_hierarchy': {cur_depth: cur_node},
             'name': 'output-tensor' if cur_depth == 0 else 'hidden-tensor',
             'collect_attributes': collect_attributes,
-            'store_tensor_data': store_tensor_data, 'max_tensor_bytes': max_tensor_bytes
+            'store_tensor_data': store_tensor_data, 'tensor_store': tensor_store
         }
         traverse_data_inplace(out, attach_node(attach_kwargs))
 
@@ -500,7 +500,7 @@ def insert_empty_pass_node(
         },
         collect_attributes=out_node.collect_attributes,
         store_tensor_data=out_node.store_tensor_data,
-        max_tensor_bytes=out_node.max_tensor_bytes,
+        tensor_store=out_node._tensor_store,
     )
 
     out_node.context.append(passed_out_node)

@@ -342,46 +342,88 @@ def generate_html_from_networkx(G, direction: str = 'LR') -> str:
     import networkx as nx
     
     # ==========================================================================
-    # Compute DAG layout using graphviz for exact matching
+    # Compute DAG layout using graphviz for exact matching (same settings as draw_graph)
     # ==========================================================================
     def compute_graphviz_layout(G, direction='LR'):
-        """Use graphviz to compute exact positions matching the PNG output."""
+        """Use graphviz to compute exact positions matching the PNG output.
+        Uses the exact same settings as draw_graph in torchview.py."""
         from graphviz import Digraph
         import subprocess
-        import re
         
-        # Create graphviz graph with same structure
-        dot = Digraph(engine='dot')
-        dot.attr(rankdir=direction, splines='ortho')
-        dot.attr('node', shape='box', fontname='monospace', fontsize='10')
-        
-        # Build subgraph hierarchy
+        # Build subgraph hierarchy (parent -> children relationship)
         subgraphs_info = G.graph.get('subgraphs', {})
         
-        # Create subgraph clusters
-        subgraph_objects = {}
+        # Build parent-child relationships
+        children_map = {}  # parent_id -> [child_ids]
+        root_subgraphs = []  # subgraphs with no parent
         for sg_id, sg_info in subgraphs_info.items():
-            sg = Digraph(name=sg_id)
-            sg.attr(label=sg_info.get('label', ''), style='dashed')
-            subgraph_objects[sg_id] = sg
+            parent = sg_info.get('parent')
+            if parent:
+                if parent not in children_map:
+                    children_map[parent] = []
+                children_map[parent].append(sg_id)
+            else:
+                root_subgraphs.append(sg_id)
         
-        # Add nodes to appropriate subgraphs
-        node_to_sg = {}
+        # Create graphviz graph with EXACT settings from draw_graph in torchview.py
+        # Graph attributes
+        graph_attr = {
+            'ordering': 'in',
+            'rankdir': direction,
+        }
+        # Node attributes (from torchview.py)
+        node_attr = {
+            'style': 'filled',
+            'shape': 'plaintext',
+            'align': 'left',
+            'fontsize': '10',
+            'ranksep': '0.1',
+            'height': '0.2',
+            'fontname': 'Linux libertine',
+            'margin': '0',
+        }
+        # Edge attributes
+        edge_attr = {
+            'fontsize': '10',
+        }
+        
+        dot = Digraph(engine='dot', strict=True,
+                      graph_attr=graph_attr, node_attr=node_attr, edge_attr=edge_attr)
+        
+        # Create nested subgraph objects recursively
+        subgraph_objects = {}
+        
+        def create_subgraph(sg_id, parent_graph):
+            """Recursively create subgraph with its children."""
+            sg_info = subgraphs_info.get(sg_id, {})
+            # Use cluster_ prefix for graphviz clustering
+            sg = Digraph(name=sg_id)  # sg_id already has 'cluster_' prefix
+            sg.attr(style='dashed', label=sg_info.get('label', ''), labeljust='l', fontsize='12')
+            subgraph_objects[sg_id] = sg
+            
+            # Recursively create children subgraphs
+            for child_id in children_map.get(sg_id, []):
+                child_sg = create_subgraph(child_id, sg)
+                sg.subgraph(child_sg)
+            
+            return sg
+        
+        # Create all root subgraphs (they will recursively create children)
+        for sg_id in root_subgraphs:
+            root_sg = create_subgraph(sg_id, dot)
+            dot.subgraph(root_sg)
+        
+        # Add nodes to appropriate subgraphs (deepest subgraph)
         for node_id, attrs in G.nodes(data=True):
             sg_id = attrs.get('subgraph')
-            node_to_sg[node_id] = sg_id
-            
             # Sanitize node id for graphviz
             safe_id = node_id.replace('.', '_').replace('-', '_')
+            node_label = attrs.get('name', node_id)
             
             if sg_id and sg_id in subgraph_objects:
-                subgraph_objects[sg_id].node(safe_id, label=attrs.get('name', node_id))
+                subgraph_objects[sg_id].node(safe_id, label=node_label)
             else:
-                dot.node(safe_id, label=attrs.get('name', node_id))
-        
-        # Add subgraphs to main graph
-        for sg_id, sg in subgraph_objects.items():
-            dot.subgraph(sg)
+                dot.node(safe_id, label=node_label)
         
         # Add edges
         for src, tgt, attrs in G.edges(data=True):
@@ -393,7 +435,6 @@ def generate_html_from_networkx(G, direction: str = 'LR') -> str:
         
         # Get positions using graphviz
         try:
-            # Render to get positions
             dot_source = dot.source
             result = subprocess.run(
                 ['dot', '-Tplain'],
@@ -405,8 +446,8 @@ def generate_html_from_networkx(G, direction: str = 'LR') -> str:
             if result.returncode != 0:
                 raise Exception(f"Graphviz error: {result.stderr}")
             
-            # Scale factors for spacing (increase x_scale for more horizontal gap)
-            x_scale = 220  # Increased from 72 for more horizontal spacing
+            # Scale factors for spacing
+            x_scale = 220
             y_scale = 100
             
             positions = {}
@@ -495,32 +536,80 @@ def generate_html_from_networkx(G, direction: str = 'LR') -> str:
         positions = compute_dag_layout(G, direction)
     
     # ==========================================================================
-    # Compute subgraph bounding boxes (module enclosures)
+    # Compute subgraph bounding boxes (nested module enclosures)
     # ==========================================================================
     subgraphs = G.graph.get('subgraphs', {})
     subgraph_boxes = {}
-    padding = 40
+    padding = 30
+    label_height = 20
     
+    # Build parent-child relationships for hierarchy
+    children_map = {}  # parent_id -> [child_ids]
     for sg_id, sg_info in subgraphs.items():
-        # Find all nodes in this subgraph
-        sg_nodes = [n for n, attrs in G.nodes(data=True) 
-                    if attrs.get('subgraph') == sg_id]
+        parent = sg_info.get('parent')
+        if parent:
+            if parent not in children_map:
+                children_map[parent] = []
+            children_map[parent].append(sg_id)
+    
+    # Get all descendant subgraph IDs for a given subgraph
+    def get_all_descendants(sg_id):
+        """Recursively get all descendant subgraph IDs."""
+        descendants = set()
+        for child in children_map.get(sg_id, []):
+            descendants.add(child)
+            descendants.update(get_all_descendants(child))
+        return descendants
+    
+    # Get all nodes that belong to a subgraph or any of its descendants
+    def get_all_nodes_in_hierarchy(sg_id):
+        """Get all nodes in this subgraph and all nested descendants."""
+        all_sg_ids = {sg_id} | get_all_descendants(sg_id)
+        nodes = []
+        for n, attrs in G.nodes(data=True):
+            if attrs.get('subgraph') in all_sg_ids:
+                nodes.append(n)
+        return nodes
+    
+    # Compute bounding boxes - process from deepest to shallowest
+    # Sort by depth (deepest first)
+    sorted_subgraphs = sorted(
+        subgraphs.items(),
+        key=lambda x: x[1].get('depth', 0),
+        reverse=True
+    )
+    
+    for sg_id, sg_info in sorted_subgraphs:
+        # Get all nodes in this subgraph hierarchy (including nested)
+        sg_nodes = get_all_nodes_in_hierarchy(sg_id)
         
         if not sg_nodes:
             continue
         
-        # Compute bounding box
+        # Get positions of all nodes
         xs = [positions[n][0] for n in sg_nodes if n in positions]
         ys = [positions[n][1] for n in sg_nodes if n in positions]
         
+        # Also include bounding boxes of direct child subgraphs
+        for child_id in children_map.get(sg_id, []):
+            if child_id in subgraph_boxes:
+                child_box = subgraph_boxes[child_id]
+                xs.extend([child_box['x'], child_box['x'] + child_box['width']])
+                ys.extend([child_box['y'], child_box['y'] + child_box['height']])
+        
         if xs and ys:
+            depth = sg_info.get('depth', 1)
+            # Add more padding for outer (shallower) boxes
+            depth_padding = padding + (5 - min(depth, 5)) * 5
+            
             subgraph_boxes[sg_id] = {
-                'x': min(xs) - padding - 90,
-                'y': min(ys) - padding - 40,
-                'width': max(xs) - min(xs) + 2 * padding + 180,
-                'height': max(ys) - min(ys) + 2 * padding + 80,
+                'x': min(xs) - depth_padding - 60,
+                'y': min(ys) - depth_padding - label_height,
+                'width': max(xs) - min(xs) + 2 * depth_padding + 120,
+                'height': max(ys) - min(ys) + 2 * depth_padding + label_height + 40,
                 'label': sg_info.get('label', sg_id),
-                'depth': sg_info.get('depth', 1),
+                'depth': depth,
+                'parent': sg_info.get('parent'),
             }
     
     # ==========================================================================

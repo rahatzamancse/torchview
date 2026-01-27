@@ -3,17 +3,20 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import nullcontext
-from typing import Any, Callable, Union
+from typing import Any, Callable, Union, TYPE_CHECKING
 
 import torch.nn as nn
 from graphviz import Digraph
 from torch.nn.modules import Identity
 
 from .computation_node import FunctionNode, ModuleNode, NodeContainer, TensorNode
-from .computation_node.compute_node import DEFAULT_MAX_TENSOR_BYTES
+from .tensor_store import TensorStore
 from .utils import assert_input_type, updated_dict
 
 import networkx as nx
+
+if TYPE_CHECKING:
+    import numpy as np
 
 COMPUTATION_NODES = Union[TensorNode, ModuleNode, FunctionNode]
 
@@ -80,7 +83,7 @@ class ComputationGraph:
         collect_attributes: bool = False,
         model: nn.Module | None = None,
         store_tensor_data: bool = False,
-        max_tensor_bytes: int = DEFAULT_MAX_TENSOR_BYTES,
+        tensor_store: TensorStore | None = None,
     ):
         '''
         Resets the running_node_id, id_dict when a new ComputationGraph is initialized.
@@ -92,9 +95,12 @@ class ComputationGraph:
         else:
             self.module_name_map = {}
 
-        # Tensor storage settings
+        # Tensor storage settings - create TensorStore if needed
         self.store_tensor_data = store_tensor_data
-        self.max_tensor_bytes = max_tensor_bytes
+        if store_tensor_data and tensor_store is None:
+            self.tensor_store: TensorStore | None = TensorStore()
+        else:
+            self.tensor_store = tensor_store
 
         self.visual_graph = visual_graph
         self.root_container = root_container
@@ -127,7 +133,7 @@ class ComputationGraph:
             'current_depth': 0,
             'collect_attributes': self.collect_attributes,
             'store_tensor_data': self.store_tensor_data,
-            'max_tensor_bytes': self.max_tensor_bytes,
+            'tensor_store': self.tensor_store,
         }
         self.running_node_id: int = 0
         self.running_subgraph_id: int = 0
@@ -147,6 +153,30 @@ class ComputationGraph:
         }
         for root_node in self.root_container:
             root_node.context = self.node_hierarchy[main_container_module]
+
+    def cleanup(self) -> None:
+        '''Clean up tensor storage files.
+        
+        Call this method when the graph is no longer needed to free disk space.
+        The TensorStore will also clean up automatically on garbage collection
+        or interpreter exit.
+        '''
+        if self.tensor_store is not None:
+            self.tensor_store.cleanup()
+            self.tensor_store = None
+
+    def get_tensor_data(self, node: TensorNode) -> np.ndarray | None:
+        '''Load tensor data for a node from disk.
+        
+        Args:
+            node: The TensorNode to get data for.
+            
+        Returns:
+            Numpy array if data is available, None otherwise.
+        '''
+        if not node.has_tensor_data() or self.tensor_store is None:
+            return None
+        return node.get_tensor_data()
 
     def fill_visual_graph(self) -> None:
         '''Fills the graphviz graph with desired nodes and edges.'''
@@ -522,7 +552,9 @@ class ComputationGraph:
                 attrs['is_output'] = node.is_leaf()
                 attrs['is_aux'] = node.is_aux
                 if node.has_tensor_data():
-                    attrs['tensor_data'] = node.tensor_data
+                    # Store path to memmap file instead of loading data into memory
+                    attrs['tensor_path'] = node.tensor_path
+                    attrs['tensor_dtype'] = node.tensor_dtype
             
             elif isinstance(node, ModuleNode):
                 attrs['node_type'] = 'module'
