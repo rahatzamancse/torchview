@@ -7,6 +7,7 @@ avoiding memory issues with large models by storing tensors to disk.
 from __future__ import annotations
 
 import atexit
+import logging
 import shutil
 import tempfile
 from pathlib import Path
@@ -16,6 +17,21 @@ import numpy as np
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+# Set up logger for tensor storage monitoring
+logger = logging.getLogger("torchview.tensor_store")
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format byte size as human-readable string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
 class TensorStore:
@@ -62,8 +78,15 @@ class TensorStore:
         self._file_counter = 0
         self._paths: list[str] = []
         
+        # Disk usage tracking per layer/node
+        self._layer_sizes: dict[str, int] = {}  # layer_name -> cumulative bytes
+        self._total_bytes: int = 0
+        self._tensor_count: int = 0
+        
         # Register cleanup on interpreter exit
         atexit.register(self.cleanup)
+        
+        logger.info(f"📦 TensorStore init → {self._temp_dir}")
     
     @property
     def cache_dir(self) -> str:
@@ -92,6 +115,30 @@ class TensorStore:
         np.save(str(filepath), data)
         
         self._paths.append(str(filepath))
+        
+        # Calculate tensor size and update tracking
+        tensor_bytes = data.nbytes
+        self._total_bytes += tensor_bytes
+        self._tensor_count += 1
+        
+        # Extract layer name from node_id (before any numeric suffixes)
+        # e.g., "transformer.h.0.attn_123" -> "transformer.h.0.attn"
+        layer_name = node_id.rsplit("_", 1)[0] if "_" in node_id else node_id
+        
+        # Update per-layer cumulative size
+        if layer_name not in self._layer_sizes:
+            self._layer_sizes[layer_name] = 0
+        self._layer_sizes[layer_name] += tensor_bytes
+        
+        # Log tensor save details
+        logger.info(
+            f"💾 #{self._tensor_count} | {node_id} | "
+            f"{data.shape} {data.dtype} | "
+            f"📄 {_format_size(tensor_bytes)} | "
+            f"📁 {_format_size(self._layer_sizes[layer_name])} | "
+            f"📊 {_format_size(self._total_bytes)}"
+        )
+        
         return str(filepath)
     
     def load(self, path: str) -> NDArray[np.floating]:
@@ -129,11 +176,56 @@ class TensorStore:
         """
         try:
             if Path(self._temp_dir).exists():
+                if self._tensor_count > 0:
+                    logger.info(
+                        f"🧹 Cleanup | {self._tensor_count} tensors | "
+                        f"{_format_size(self._total_bytes)} | {len(self._layer_sizes)} layers"
+                    )
                 shutil.rmtree(self._temp_dir)
                 self._paths.clear()
+                self._layer_sizes.clear()
+                self._total_bytes = 0
+                self._tensor_count = 0
         except Exception:
             # Ignore errors during cleanup (directory may already be gone)
             pass
+    
+    def get_stats(self) -> dict:
+        """Get disk usage statistics.
+        
+        Returns:
+            Dictionary with total_bytes, tensor_count, layer_sizes, and formatted strings.
+        """
+        return {
+            "total_bytes": self._total_bytes,
+            "total_size_formatted": _format_size(self._total_bytes),
+            "tensor_count": self._tensor_count,
+            "layer_count": len(self._layer_sizes),
+            "layer_sizes": {
+                layer: {
+                    "bytes": size,
+                    "formatted": _format_size(size)
+                }
+                for layer, size in self._layer_sizes.items()
+            },
+            "top_layers_by_size": sorted(
+                self._layer_sizes.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:10],
+        }
+    
+    def log_summary(self) -> None:
+        """Log a summary of disk usage statistics."""
+        stats = self.get_stats()
+        logger.info(
+            f"📊 Summary | {stats['tensor_count']} tensors | "
+            f"{stats['layer_count']} layers | {stats['total_size_formatted']}"
+        )
+        if stats['top_layers_by_size']:
+            logger.info("🏆 Top layers:")
+            for i, (layer, size) in enumerate(stats['top_layers_by_size'], 1):
+                logger.info(f"  {i}. {layer}: {_format_size(size)}")
     
     def __del__(self) -> None:
         """Cleanup on garbage collection."""
@@ -144,4 +236,8 @@ class TensorStore:
         return len(self._paths)
     
     def __repr__(self) -> str:
-        return f"TensorStore(dir={self._temp_dir!r}, tensors={len(self._paths)})"
+        return (
+            f"TensorStore(dir={self._temp_dir!r}, "
+            f"tensors={self._tensor_count}, "
+            f"total_size={_format_size(self._total_bytes)})"
+        )
